@@ -20,6 +20,6 @@ def cloudfunctions(request):
     elif request_args and 'name' in request_args:
         name = request_args['name']
     else:
-        name = "Waorld-ade11112s11212312123jploysss"
+        name = "Waorld-deploy"
 
     return f'cloudfunctions {name}!'
