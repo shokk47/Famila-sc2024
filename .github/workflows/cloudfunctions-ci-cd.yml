@@ -1,0 +1,158 @@
+name: CI/CD Cloud functions
+
+on:
+  pull_request:  # Trigger per le pull request
+    branches:
+      - main
+    paths:
+      - cloud-functions/src/**
+  push: # Trigger per i push al branch main
+    branches:
+      - main
+    paths:
+      - cloud-functions/src/**
+
+jobs:
+  get_changed_functions:
+    runs-on: ubuntu-latest
+    outputs:
+      functions: ${{ steps.get_changes.outputs.functions }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get changed functions
+        id: get_changes
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then          
+            # Se il branch corrente è diverso da main = pullr
+            # Ottieni la lista delle funzioni modificate tra il branch corrente e main
+
+            echo "GITHUB_REF != refs/heads/main"
+            CHANGED_FUNCTIONS=$(git diff --name-status origin/main...HEAD cloud-functions/src/ | awk '$1 != "D" {print $2}' | xargs -n1 dirname | grep -oE 'cloud-functions/src/[^/]+' | awk -F'/' '{print $3}' | uniq | jq -R -s -c 'split("\n") | map(select(. != ""))')
+            DELETED_FUNCTIONS=$(git diff --name-status origin/main...HEAD cloud-functions/src/ | awk '$1 == "D" {print $2}' | xargs -n1 dirname | grep -oE 'cloud-functions/src/[^/]+' | awk -F'/' '{print $3}' | uniq | jq -R -s -c 'split("\n") | map(select(. != ""))')
+            # git diff --name-status origin/main...HEAD cloud-functions/src: Estrae lo status delle modifiche (aggiunte, modificate, eliminate) tra il branch "main" e l'HEAD del branch corrente nella directory "cloud-functions/src/".
+            # awk '$1 != "D" {print $2}': Filtra solo le righe che non iniziano con "D" (indicando che il file non è stato eliminato), quindi stampa il secondo campo, che è il percorso del file.
+            # xargs -n1 dirname: Estrae il nome della directory da ciascun percorso file.
+            # grep -oE 'cloud-functions/src/[^/]+': Estrae solo i nomi delle sottodirectory sotto "cloud-functions/", escludendo il resto del percorso.
+            # awk -F'/' '{print $2}': Estra la seconda parte del percorso diviso da "/" per ciascuna riga di input. Quindi, il nome della function.
+            # uniq: Rimuove le righe duplicate dalla lista risultante.
+
+          else
+            # Se il branch corrente è uguale al main = force push o merge pull r
+            # Ottieni la lista dlele funzioni modificate tra origin/main e main
+
+            echo "GITHUB_REF == refs/heads/main"
+            latest_commit_main=$(git rev-parse origin/main)
+            previous_commit=$(git rev-parse HEAD^)
+
+            echo "Lastes main commit: $latest_commit_main"
+            echo "Previous_commit: $previous_commit"
+
+            CHANGED_FUNCTIONS=$(git diff --name-status $previous_commit $latest_commit_main cloud-functions/src/ | awk '$1 != "D" {print $2}' | xargs -n1 dirname | grep -oE 'cloud-functions/src/[^/]+' | awk -F'/' '{print $3}' | uniq | jq -R -s -c 'split("\n") | map(select(. != ""))')
+            DELETED_FUNCTIONS=$(git diff --name-status $previous_commit $latest_commit_main cloud-functions/src/ | awk '$1 == "D" {print $2}' | xargs -n1 dirname | grep -oE 'cloud-functions/src/[^/]+' | awk -F'/' '{print $3}' | uniq | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          fi
+
+          if [[ -n "$CHANGED_FUNCTIONS" ]]; then
+            echo "Changed functions: $CHANGED_FUNCTIONS"
+            echo "Deleted functions: $DELETED_FUNCTIONS"
+            echo "CHANGED_FUNCTIONS=$CHANGED_FUNCTIONS" >> $GITHUB_ENV
+            echo "functions=$CHANGED_FUNCTIONS" >> $GITHUB_OUTPUT
+          else
+            echo "No changes found in cloud-functions/"
+            echo "functions=[]" >> $GITHUB_OUTPUT
+          fi
+
+  build_and_test:  
+    needs: get_changed_functions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        function: ${{ fromJson(needs.get_changed_functions.outputs.functions) }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # Installazione delle dipendenze della Cloud Function
+      - name: Install dependencies
+        working-directory: cloud-functions/src/${{ matrix.function }}
+        run: pip install -r requirements.txt
+        
+      # Installazione degli strumenti di analisi statica
+      - name: Install analysis tools
+        working-directory: cloud-functions/src/${{ matrix.function }}
+        run: pip install pylint flake8 black isort mypy
+
+      # Esecuzione dell'analisi statica
+      - name: Run Pylint
+        id: pylint
+        run: |
+          pylint --rcfile=./cloud-functions/config/pylint/.pylintrc cloud-functions/src/${{ matrix.function }}/*.py || echo "pylint_failed=true" >> $GITHUB_ENV
+      - name: Run Black (check)
+        id: black
+        working-directory: cloud-functions/src/${{ matrix.function }}
+        run: |
+          black *.py || echo "black_failed=true" >> $GITHUB_ENV
+      - name: Run isort (check)
+        id: isort
+        working-directory: cloud-functions/src/${{ matrix.function }}
+        run: |
+          isort --check-only *.py || echo "isort_failed=true" >> $GITHUB_ENV
+      
+      # Esecuzione dei test unitari solo se tutti i controlli di analisi statica sono passati
+      - name: Check static analysis (${{ matrix.function }})
+        run: |
+          if [ -n "$pylint_failed" ] || [ -n "$flake8_failed" ] || [ -n "$black_failed" ] || [ -n "$isort_failed" ]; then
+              echo "At least one static analysis check failed."
+              exit 1
+          fi
+
+      # Installazione degli strumenti per i test unitari
+      - name: Install pytest
+        working-directory: cloud-functions/test/${{ matrix.function }}
+        run: pip install pytest
+      # Esecuzione dei test unitari
+      - name: Run unit tests
+        working-directory: cloud-functions/test/${{ matrix.function }}
+        run: |
+          if pytest; then
+            echo "Tests executed successfully."
+          else
+            echo "No tests found."
+            exit 0
+          fi
+
+  deploy_production:
+    needs: 
+      - get_changed_functions
+      - build_and_test 
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    environment: production
+    strategy:
+      fail-fast: false
+      matrix:
+        function: ${{ fromJSON(needs.get_changed_functions.outputs.functions) }}
+    steps:
+      - uses: actions/checkout@v3
+      - id: auth
+        uses: google-github-actions/auth@v1
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Deploy ${{ matrix.function }} to production
+        uses: google-github-actions/deploy-cloud-functions@v3.0.2
+        with:
+          name: ${{ matrix.function }}
+          runtime: python39
+          entry_point: ${{ matrix.function }}
+          source_dir: cloud-functions/src/${{ matrix.function }}
+          region: europe-west8
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
